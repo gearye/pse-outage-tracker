@@ -2,11 +2,21 @@ require("dotenv").config(); // Load environment variables from .env
 const express = require("express");
 const axios = require("axios");
 const path = require("path");
+const fs = require("fs");
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const STATE_FILE = path.join(__dirname, "state.json");
 
-// In-memory storage for cached data
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+if (!GOOGLE_MAPS_API_KEY) {
+  console.error(
+    "Google Maps API key is required. Set it via GOOGLE_MAPS_API_KEY."
+  );
+  process.exit(1);
+}
+
+// In-memory storage
 let cachedData = null; // Stores the latest categorized data
 let initialOutages = new Map(); // Outages at the start of the day
 let lastResetDate = null; // Tracks the last date the initialOutages was reset
@@ -23,15 +33,42 @@ function isNewDay() {
   return false;
 }
 
-// Function to fetch data from the PSE API
+// Load state (initialOutages and lastResetDate) from file
+function loadStateFromFile() {
+  if (fs.existsSync(STATE_FILE)) {
+    try {
+      const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+      initialOutages = new Map(
+        state.initialOutages.map(([key, value]) => [key, value])
+      );
+      lastResetDate = state.lastResetDate;
+      console.log("Loaded state from file.");
+    } catch (error) {
+      console.error("Error reading state file:", error);
+    }
+  } else {
+    console.log("No state file found, starting fresh.");
+  }
+}
+
+// Save state (initialOutages and lastResetDate) to file
+function saveStateToFile() {
+  const state = {
+    initialOutages: Array.from(initialOutages.entries()),
+    lastResetDate,
+  };
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  console.log("Saved state to file.");
+}
+
+// Fetch data from the PSE API
 async function fetchPSEData() {
   try {
     const response = await axios.get(
-      "https://www.pse.com/api/sitecore/OutageMap/AnonymoussMapListView",
+      "https://www.pse.com/api/sitecore/OutageMap/AnonymoussMapListView"
     );
     const data = response.data;
 
-    // Process outages from the response
     const newOutages = new Map();
     data.PseMap.forEach((entry) => {
       const id = entry.DataProvider.PointOfInterest.Id;
@@ -46,6 +83,7 @@ async function fetchPSEData() {
     if (isNewDay()) {
       console.log("Resetting initialOutages for a new day");
       initialOutages = new Map(newOutages);
+      saveStateToFile();
     }
 
     // Categorize outages
@@ -69,7 +107,7 @@ async function fetchPSEData() {
 
     // Cache the categorized data
     cachedData = { added, ended, existing };
-    console.log("Data fetched from PSE API and cached");
+    console.log("Data fetched from PSE API and cached.");
   } catch (error) {
     console.error("Error fetching data from PSE API:", error);
   }
@@ -87,7 +125,7 @@ app.get("/", (req, res) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>PSE Outage Map</title>
-        <script src="https://maps.googleapis.com/maps/api/js?key=${process.env.GOOGLE_MAPS_API_KEY}"></script>
+        <script src="https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}"></script>
         <style>
             body, html {
                 margin: 0;
@@ -111,14 +149,12 @@ app.get("/", (req, res) => {
 // API endpoint to serve cached data
 app.get("/api/outages", (req, res) => {
   if (!cachedData) {
-    // If no data is cached, fetch immediately
     fetchPSEData()
       .then(() =>
-        res.json(cachedData || { added: [], ended: [], existing: [] }),
+        res.json(cachedData || { added: [], ended: [], existing: [] })
       )
       .catch((err) => res.status(500).json({ error: "Failed to fetch data" }));
   } else {
-    // Serve cached data
     res.json(cachedData);
   }
 });
@@ -126,7 +162,8 @@ app.get("/api/outages", (req, res) => {
 // Schedule periodic fetching every 5 minutes
 setInterval(fetchPSEData, 5 * 60 * 1000); // 5 minutes
 
-// Fetch initial data on server startup
+// On startup, load state and fetch data
+loadStateFromFile();
 fetchPSEData();
 
 app.listen(PORT, () => {
